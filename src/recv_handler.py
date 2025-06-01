@@ -292,6 +292,63 @@ class RecvHandler:
         reply_pattern = r'\[CQ:reply,id=(.*?)\]'
         reply_matches = re.findall(reply_pattern, real_message)
         logger.info(f"reply_matches: {reply_matches}")
+        json_pattern = r'\[CQ:json,data=(.*?)\]'
+        json_matches = re.findall(json_pattern, real_message)
+        logger.info(f"json_matches: {json_matches}")
+        # 处理json消息
+        for json_data in json_matches:
+            # 存储未处理的json_data
+            unprocessed_json_data = json_data
+            # 转义
+            json_data = json_data.replace('&quot;', '"')
+            json_data = json_data.replace('&lt;', '<')
+            json_data = json_data.replace('&gt;', '>')
+            json_data = json_data.replace('&amp;', '&')
+            json_data = json_data.replace('&#44;', ',')
+            json_data = json_data.replace('&#91;', '[')
+            json_data = json_data.replace('&#93;', ']')
+            json_data = json_data.replace('&#123;', '{')
+            json_data = json_data.replace('&#125;', '}')
+            json_data = json_data.replace('&#46;', '.')
+            json_data = json_data.replace('&#58;', ':')
+            json_data = json_data.replace('&#45;', '-')
+            json_data = json_data.replace('&#43;', '+')
+            json_data = json_data.replace('&#61;', '=')
+            json_data = json_data.replace('&#39;', "'")
+            json_data = json_data.replace('&#34;', '"')
+            json_data = json_data.replace('&#47;', '/')
+            json_data = json_data.replace('&#92;', '\\')
+            json_data = json_data.replace('&#126;', '~')
+            json_data = json_data.replace('&#33;', '!')
+            json_data = json_data.replace('&#64;', '@')
+            try:
+                # 尝试解析JSON数据
+                json_data = json.loads(json_data)
+                # 查看群公告可能性
+                # 一般像这样 [CQ:json,data={app:com.tencent.mannounce&#44;bizsrc:&#44;config:{ctime:1748767900&#44;forward:0&#44;token:76ab5d40224d2f0036876cbe3fc9150a}&#44;extra:{app_type:1&#44;appid:1101236949&#44;uin:2704503676}&#44;meta:{mannounce:{cr:0&#44;encode:1&#44;fid:3d64793d000000009c143c68cdfd0200&#44;gc:1031365693&#44;sign:e67d7230003e2d325307ef49649cef1a&#44;text:5o2V5o2J5raI5oGv&#44;title:576k5YWs5ZGK&#44;tw:0&#44;uin:2704503676}}&#44;prompt:&#91;群公告&#93;捕捉消息&#44;ver:1.0.0.43&#44;view:main}]&#91;分享&#93; 不支持的消息类型，请到手机上查看
+                # 检测是否是群公告
+                # 去除消息中的CQ:json标签
+                text_pattern = text_pattern.replace(f'[CQ:json,data={json.dumps(unprocessed_json_data)}]', '')
+                logger.info(f"原始JSON数据：{json_data}")
+                if json_data.get('meta') and json_data.get('meta').get('mannounce'):
+                    # 提取群公告内容
+                    text = json_data.get('prompt')
+                    # 提取群公告时间
+                    time_stamp = json_data.get('meta').get('mannounce').get('ctime')
+                    time_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time_stamp))
+                    user = await get_member_info(self.server_connection, raw_message.get('group_id'), json_data.get('meta').get('mannounce').get('uin'))
+                    if user:
+                        text = f"{user.get('nickname')}({user.get('user_id')})：{text}"
+                    else:
+                        text = f"未知用户：{text}"
+                    logger.info(f"群公告：{text} 发布时间：{time_stamp} 用户信息：{user}")
+                    seg_message.append(Seg(type="text", data=f"群公告：{text} 发布时间：{time_stamp} 用户信息：{user}"))
+                else:
+                    # 不是群公告，直接添加到消息段列表中
+                    seg_message.append(Seg(type="json", data=json_data))
+            except json.JSONDecodeError:
+                # 如果解析失败，直接添加到消息段列表中
+                seg_message.append(Seg(type="text", data=json_data))
 
         for reply_id in reply_matches:
             # 获取引用消息的详细信息
