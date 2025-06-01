@@ -23,7 +23,7 @@ class Config:
         self.config_path = os.path.join(self.root_path, "config.toml")
 
     def load_config(self):  # sourcery skip: extract-method, move-assign
-        include_configs = ["Napcat_Server", "MaiBot_Server", "Chat", "Voice", "Debug"]
+        include_configs = ["gocq_Server", "MaiBot_Server", "Chat", "Voice", "Debug"]
         if not os.path.exists(self.config_path):
             logger.error("配置文件不存在！")
             logger.info("正在创建配置文件...")
@@ -45,9 +45,9 @@ class Config:
                 logger.error("你的配置文件可能过时，请尝试手动更新配置文件。")
                 sys.exit(1)
 
-        self.server_host = raw_config["Napcat_Server"].get("host", "localhost")
-        self.server_port = raw_config["Napcat_Server"].get("port", 8095)
-        self.napcat_heartbeat_interval = raw_config["Napcat_Server"].get("heartbeat", 30)
+        self.server_host = raw_config["gocq_Server"].get("host", "localhost")
+        self.server_port = raw_config["gocq_Server"].get("port", 8095)
+        self.napcat_heartbeat_interval = raw_config["gocq_Server"].get("heartbeat", 30)
 
         self.mai_host = raw_config["MaiBot_Server"].get("host", "localhost")
         self.mai_port = raw_config["MaiBot_Server"].get("port", 8000)
@@ -78,7 +78,7 @@ class Config:
             logger.debug("读取到的配置内容：")
             logger.debug(f"平台: {self.platform}")
             logger.debug(f"MaiBot服务器地址: {self.mai_host}:{self.mai_port}")
-            logger.debug(f"Napcat服务器地址: {self.server_host}:{self.server_port}")
+            logger.debug(f"gocq服务器地址: {self.server_host}:{self.server_port}")
             logger.debug(f"心跳间隔: {self.napcat_heartbeat_interval}秒")
             logger.debug(f"群聊列表类型: {self.group_list_type}")
             logger.debug(f"群聊列表: {self.group_list}")

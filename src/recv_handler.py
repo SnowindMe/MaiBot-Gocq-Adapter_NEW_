@@ -98,7 +98,7 @@ class RecvHandler:
     async def handle_raw_message(self, raw_message: dict) -> None:
         # sourcery skip: low-code-quality, remove-unreachable-code
         """
-        从Napcat接受的原始消息处理
+        从gocq接受的原始消息处理
 
         Parameters:
             raw_message: dict: 原始消息
@@ -140,7 +140,7 @@ class RecvHandler:
 
                 sender_info: dict = raw_message.get("sender")
 
-                # 由于临时会话中，Napcat默认不发送成员昵称，所以需要单独获取
+                # 由于临时会话中，gocq默认不发送成员昵称，所以需要单独获取
                 fetched_member_info: dict = await get_member_info(
                     self.server_connection,
                     raw_message.get("group_id"),
@@ -325,7 +325,6 @@ class RecvHandler:
                 # 尝试解析JSON数据
                 json_data = json.loads(json_data)
                 # 查看群公告可能性
-                # 一般像这样 [CQ:json,data={app:com.tencent.mannounce&#44;bizsrc:&#44;config:{ctime:1748767900&#44;forward:0&#44;token:76ab5d40224d2f0036876cbe3fc9150a}&#44;extra:{app_type:1&#44;appid:1101236949&#44;uin:2704503676}&#44;meta:{mannounce:{cr:0&#44;encode:1&#44;fid:3d64793d000000009c143c68cdfd0200&#44;gc:1031365693&#44;sign:e67d7230003e2d325307ef49649cef1a&#44;text:5o2V5o2J5raI5oGv&#44;title:576k5YWs5ZGK&#44;tw:0&#44;uin:2704503676}}&#44;prompt:&#91;群公告&#93;捕捉消息&#44;ver:1.0.0.43&#44;view:main}]&#91;分享&#93; 不支持的消息类型，请到手机上查看
                 # 检测是否是群公告
                 # 去除消息中的CQ:json标签
                 text_pattern = text_pattern.replace(f'[CQ:json,data={json.dumps(unprocessed_json_data)}]', '')
@@ -368,6 +367,7 @@ class RecvHandler:
         if text_pattern.strip():
             seg_message.append(Seg(type="text", data=text_pattern.strip()))
         return seg_message
+
     async def handle_text_message(self, raw_message: dict) -> Seg:
         """
         处理纯文本信息
@@ -378,7 +378,7 @@ class RecvHandler:
         """
         message_data: dict = raw_message.get("data")
         plain_text: str = message_data.get("text")
-        return Seg(type=RealMessageType.text, data=plain_text)
+        return Seg(type="text", data=plain_text)
 
     async def handle_face_message(self, raw_message: dict) -> Seg | None:
         """
@@ -484,7 +484,7 @@ class RecvHandler:
             return None
         return response_data.get("messages")
 
-    async def handle_reply_message(self, raw_message: dict) -> Seg | None:
+    async def handle_reply_message(self, raw_message: dict) -> List[Seg] | None:
         # sourcery skip: move-assign-in-block, use-named-expression
         """
         处理回复消息
@@ -633,7 +633,7 @@ class RecvHandler:
         """
         # 不启用戳其他人的处理
         else:
-            # 由于Napcat不支持获取昵称，所以需要单独获取
+            # 由于gocq不支持获取昵称，所以需要单独获取
             group_id = raw_message.get("group_id")
             fetched_member_info: dict = await get_member_info(
                 self.server_connection, group_id, target_id

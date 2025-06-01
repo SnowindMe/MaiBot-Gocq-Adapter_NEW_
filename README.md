@@ -1,4 +1,4 @@
-# MaiBot 与 Napcat 的 Adapter
+# MaiBot 与 gocq 的 Adapter
 运行方式：独立/放在MaiBot本体作为插件
 
 # 使用说明
@@ -8,24 +8,24 @@
 
 ```mermaid
 sequenceDiagram
-    participant Napcat as Napcat客户端
-    participant Adapter as MaiBot-Napcat适配器
+    participant gocq as gocq客户端
+    participant Adapter as MaiBot-gocq适配器
     participant Queue as 消息队列
     participant Handler as 消息处理器
     participant MaiBot as MaiBot服务
 
-    Note over Napcat,MaiBot: 初始化阶段
-    Napcat->>Adapter: WebSocket连接(ws://localhost:8095)
+    Note over gocq,MaiBot: 初始化阶段
+    gocq->>Adapter: WebSocket连接(ws://localhost:8095)
     Adapter->>MaiBot: WebSocket连接(ws://localhost:8000)
     
-    Note over Napcat,MaiBot: 心跳检测
+    Note over gocq,MaiBot: 心跳检测
     loop 每30秒
-        Napcat->>Adapter: 发送心跳包
-        Adapter->>Napcat: 心跳响应
+        gocq->>Adapter: 发送心跳包
+        Adapter->>gocq: 心跳响应
     end
 
-    Note over Napcat,MaiBot: 消息处理流程
-    Napcat->>Adapter: 发送消息
+    Note over gocq,MaiBot: 消息处理流程
+    gocq->>Adapter: 发送消息
     Adapter->>Queue: 消息入队(message_queue)
     Queue->>Handler: 消息出队处理
     Handler->>Handler: 解析消息类型
@@ -39,12 +39,12 @@ sequenceDiagram
         Handler->>MaiBot: 发送转发消息
     end
     MaiBot-->>Adapter: 消息响应
-    Adapter-->>Napcat: 消息响应
+    Adapter-->>gocq: 消息响应
 
-    Note over Napcat,MaiBot: 优雅关闭
+    Note over gocq,MaiBot: 优雅关闭
     Adapter->>MaiBot: 关闭连接
     Adapter->>Queue: 清空消息队列
-    Adapter->>Napcat: 关闭连接
+    Adapter->>gocq: 关闭连接
 ```
 
 
