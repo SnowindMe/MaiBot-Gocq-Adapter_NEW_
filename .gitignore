@@ -19,7 +19,7 @@ elua.confirmed
 # C extensions
 *.so
 /results
-
+config_backup/
 # Distribution / packaging
 .Python
 build/
@@ -270,4 +270,8 @@ $RECYCLE.BIN/
 *.lnk
 
 config.toml
+config.toml.back
 test
+data/NapcatAdapter.db
+data/NapcatAdapter.db-shm
+data/NapcatAdapter.db-wal

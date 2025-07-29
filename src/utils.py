@@ -2,14 +2,16 @@ import websockets as Server
 import json
 import base64
 import uuid
-from .logger import logger
-from .message_queue import get_response
-
 import urllib3
 import ssl
+import io
+
+from src.database import BanUser, db_manager
+from .logger import logger
+from .response_pool import get_response
 
 from PIL import Image
-import io
+from typing import Union, List, Tuple, Optional
 
 
 class SSLAdapter(urllib3.PoolManager):
@@ -21,7 +23,7 @@ class SSLAdapter(urllib3.PoolManager):
         super().__init__(*args, **kwargs)
 
 
-async def get_group_info(websocket: Server.ServerConnection, group_id: int) -> dict:
+async def get_group_info(websocket: Server.ServerConnection, group_id: int) -> dict | None:
     """
     获取群相关信息
 
@@ -43,7 +45,29 @@ async def get_group_info(websocket: Server.ServerConnection, group_id: int) -> d
     return socket_response.get("data")
 
 
-async def get_member_info(websocket: Server.ServerConnection, group_id: int, user_id: int) -> dict:
+async def get_group_detail_info(websocket: Server.ServerConnection, group_id: int) -> dict | None:
+    """
+    获取群详细信息
+
+    返回值需要处理可能为空的情况
+    """
+    logger.debug("获取群详细信息中")
+    request_uuid = str(uuid.uuid4())
+    payload = json.dumps({"action": "get_group_detail_info", "params": {"group_id": group_id}, "echo": request_uuid})
+    try:
+        await websocket.send(payload)
+        socket_response: dict = await get_response(request_uuid)
+    except TimeoutError:
+        logger.error(f"获取群详细信息超时，群号: {group_id}")
+        return None
+    except Exception as e:
+        logger.error(f"获取群详细信息失败: {e}")
+        return None
+    logger.debug(socket_response)
+    return socket_response.get("data")
+
+
+async def get_member_info(websocket: Server.ServerConnection, group_id: int, user_id: int) -> dict | None:
     """
     获取群成员信息
 
@@ -74,17 +98,7 @@ async def get_member_info(websocket: Server.ServerConnection, group_id: int, use
 async def get_image_base64(url: str) -> str:
     # sourcery skip: raise-specific-error
     """获取图片/表情包的Base64"""
-    # 防止转义
-    url = url.replace("&amp;", "&")
-    url = url.replace("&quot;", '"')
-    url = url.replace("&#039;", "'")
-    
-    # 清理URL格式
-    if ',url=' in url:
-        url = url.split(',url=')[1]
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url.lstrip('/')
-    logger.info(f"下载图片: {url}")
+    logger.debug(f"下载图片: {url}")
     http = SSLAdapter()
     try:
         response = http.request("GET", url, timeout=10)
@@ -98,6 +112,7 @@ async def get_image_base64(url: str) -> str:
 
 
 def convert_image_to_gif(image_base64: str) -> str:
+    # sourcery skip: extract-method
     """
     将Base64编码的图片转换为GIF格式
     Parameters:
@@ -118,7 +133,7 @@ def convert_image_to_gif(image_base64: str) -> str:
         return image_base64
 
 
-async def get_self_info(websocket: Server.ServerConnection) -> dict:
+async def get_self_info(websocket: Server.ServerConnection) -> dict | None:
     """
     获取自身信息
     Parameters:
@@ -154,7 +169,7 @@ def get_image_format(raw_data: str) -> str:
     return Image.open(io.BytesIO(image_bytes)).format.lower()
 
 
-async def get_stranger_info(websocket: Server.ServerConnection, user_id: int) -> dict:
+async def get_stranger_info(websocket: Server.ServerConnection, user_id: int) -> dict | None:
     """
     获取陌生人信息
     Parameters:
@@ -179,7 +194,7 @@ async def get_stranger_info(websocket: Server.ServerConnection, user_id: int) ->
     return response.get("data")
 
 
-async def get_message_detail(websocket: Server.ServerConnection, message_id: str) -> dict:
+async def get_message_detail(websocket: Server.ServerConnection, message_id: Union[str, int]) -> dict | None:
     """
     获取消息详情，可能为空
     Parameters:
@@ -202,3 +217,94 @@ async def get_message_detail(websocket: Server.ServerConnection, message_id: str
         return None
     logger.debug(response)
     return response.get("data")
+
+
+async def get_record_detail(
+    websocket: Server.ServerConnection, file: str, file_id: Optional[str] = None
+) -> dict | None:
+    """
+    获取语音消息内容
+    Parameters:
+        websocket: WebSocket连接对象
+        file: 文件名
+        file_id: 文件ID
+    Returns:
+        dict: 返回的语音消息详情
+    """
+    logger.debug("获取语音消息详情中")
+    request_uuid = str(uuid.uuid4())
+    payload = json.dumps(
+        {
+            "action": "get_record",
+            "params": {"file": file, "file_id": file_id, "out_format": "wav"},
+            "echo": request_uuid,
+        }
+    )
+    try:
+        await websocket.send(payload)
+        response: dict = await get_response(request_uuid)
+    except TimeoutError:
+        logger.error(f"获取语音消息详情超时，文件: {file}, 文件ID: {file_id}")
+        return None
+    except Exception as e:
+        logger.error(f"获取语音消息详情失败: {e}")
+        return None
+    logger.debug(f"{str(response)[:200]}...")  # 防止语音的超长base64编码导致日志过长
+    return response.get("data")
+
+
+async def read_ban_list(
+    websocket: Server.ServerConnection,
+) -> Tuple[List[BanUser], List[BanUser]]:
+    """
+    从根目录下的data文件夹中的文件读取禁言列表。
+    同时自动更新已经失效禁言
+    Returns:
+        Tuple[
+            一个仍在禁言中的用户的BanUser列表,
+            一个已经自然解除禁言的用户的BanUser列表,
+            一个仍在全体禁言中的群的BanUser列表,
+            一个已经自然解除全体禁言的群的BanUser列表,
+        ]
+    """
+    try:
+        ban_list = db_manager.get_ban_records()
+        lifted_list: List[BanUser] = []
+        logger.info("已经读取禁言列表")
+        for ban_record in ban_list:
+            if ban_record.user_id == 0:
+                fetched_group_info = await get_group_info(websocket, ban_record.group_id)
+                if fetched_group_info is None:
+                    logger.warning(f"无法获取群信息，群号: {ban_record.group_id}，默认禁言解除")
+                    lifted_list.append(ban_record)
+                    ban_list.remove(ban_record)
+                    continue
+                group_all_shut: int = fetched_group_info.get("group_all_shut")
+                if group_all_shut == 0:
+                    lifted_list.append(ban_record)
+                    ban_list.remove(ban_record)
+                    continue
+            else:
+                fetched_member_info = await get_member_info(websocket, ban_record.group_id, ban_record.user_id)
+                if fetched_member_info is None:
+                    logger.warning(
+                        f"无法获取群成员信息，用户ID: {ban_record.user_id}, 群号: {ban_record.group_id}，默认禁言解除"
+                    )
+                    lifted_list.append(ban_record)
+                    ban_list.remove(ban_record)
+                    continue
+                lift_ban_time: int = fetched_member_info.get("shut_up_timestamp")
+                if lift_ban_time == 0:
+                    lifted_list.append(ban_record)
+                    ban_list.remove(ban_record)
+                else:
+                    ban_record.lift_time = lift_ban_time
+        db_manager.update_ban_record(ban_list)
+        return ban_list, lifted_list
+    except Exception as e:
+        logger.error(f"读取禁言列表失败: {e}")
+        return [], []
+
+
+def save_ban_record(list: List[BanUser]):
+    return db_manager.update_ban_record(list)

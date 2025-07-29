@@ -1,14 +1,23 @@
-from .logger import logger
-from .config import global_config
+from src.logger import logger
+from src.config import global_config
+from src.utils import (
+    get_group_info,
+    get_member_info,
+    get_image_base64,
+    get_record_detail,
+    get_self_info,
+    get_message_detail,
+)
 from .qq_emoji_list import qq_face
+from .message_sending import message_send_instance
+from . import RealMessageType, MessageType, ACCEPT_FORMAT
+
 import time
-import asyncio
 import json
 import websockets as Server
 from typing import List, Tuple, Optional, Dict, Any
 import uuid
 
-from . import MetaEventType, RealMessageType, MessageType, NoticeType
 from maim_message import (
     UserInfo,
     GroupInfo,
@@ -17,80 +26,70 @@ from maim_message import (
     MessageBase,
     TemplateInfo,
     FormatInfo,
-    Router,
 )
 
-from .utils import (
-    get_group_info,
-    get_member_info,
-    get_image_base64,
-    get_self_info,
-    get_stranger_info,
-    get_message_detail,
-)
-from .message_queue import get_response
+
+from src.response_pool import get_response
 
 
-class RecvHandler:
-    maibot_router: Router = None
-
+class MessageHandler:
     def __init__(self):
         self.server_connection: Server.ServerConnection = None
-        self.interval = global_config.napcat_heartbeat_interval
+        self.bot_id_list: Dict[int, bool] = {}
 
-    async def handle_meta_event(self, message: dict) -> None:
-        event_type = message.get("meta_event_type")
-        if event_type == MetaEventType.lifecycle:
-            sub_type = message.get("sub_type")
-            if sub_type == MetaEventType.Lifecycle.connect:
-                self_id = message.get("self_id")
-                self.last_heart_beat = time.time()
-                logger.info(f"Bot {self_id} 连接成功")
-                asyncio.create_task(self.check_heartbeat(self_id))
-        elif event_type == MetaEventType.heartbeat:
-            if message["status"].get("online") and message["status"].get("good"):
-                self.last_heart_beat = time.time()
-                self.interval = message.get("interval") / 1000
-            else:
-                self_id = message.get("self_id")
-                logger.warning(f"Bot {self_id} gocq 端异常！")
+    async def set_server_connection(self, server_connection: Server.ServerConnection) -> None:
+        """设置Napcat连接"""
+        self.server_connection = server_connection
 
-    async def check_heartbeat(self, id: int) -> None:
-        while True:
-            now_time = time.time()
-            if now_time - self.last_heart_beat > self.interval + 3:
-                logger.warning(f"Bot {id} 连接已断开")
-                break
-            else:
-                logger.debug("心跳正常")
-            await asyncio.sleep(self.interval)
-
-    def check_allow_to_chat(self, user_id: int, group_id: Optional[int]) -> bool:
+    async def check_allow_to_chat(
+        self,
+        user_id: int,
+        group_id: Optional[int] = None,
+        ignore_bot: Optional[bool] = False,
+        ignore_global_list: Optional[bool] = False,
+    ) -> bool:
         # sourcery skip: hoist-statement-from-if, merge-else-if-into-elif
         """
         检查是否允许聊天
         Parameters:
             user_id: int: 用户ID
             group_id: int: 群ID
+            ignore_bot: bool: 是否忽略机器人检查
+            ignore_global_list: bool: 是否忽略全局黑名单检查
         Returns:
             bool: 是否允许聊天
         """
         logger.debug(f"群聊id: {group_id}, 用户id: {user_id}")
+        if global_config.chat.ban_qq_bot and group_id and not ignore_bot:
+            logger.debug("开始判断是否为机器人")
+            member_info = await get_member_info(self.server_connection, group_id, user_id)
+            if member_info:
+                is_bot = member_info.get("is_robot")
+                if is_bot is None:
+                    logger.warning("无法获取用户是否为机器人，默认为不是但是不进行更新")
+                else:
+                    if is_bot:
+                        logger.warning("QQ官方机器人消息拦截已启用，消息被丢弃，新机器人加入拦截名单")
+                        self.bot_id_list[user_id] = True
+                        return False
+                    else:
+                        self.bot_id_list[user_id] = False
+        logger.debug("开始检查聊天白名单/黑名单")
         if group_id:
-            if global_config.group_list_type == "whitelist" and group_id not in global_config.group_list:
+            if global_config.chat.group_list_type == "whitelist" and group_id not in global_config.chat.group_list:
                 logger.warning("群聊不在聊天白名单中，消息被丢弃")
                 return False
-            elif global_config.group_list_type == "blacklist" and group_id in global_config.group_list:
+            elif global_config.chat.group_list_type == "blacklist" and group_id in global_config.chat.group_list:
                 logger.warning("群聊在聊天黑名单中，消息被丢弃")
                 return False
         else:
-            if global_config.private_list_type == "whitelist" and user_id not in global_config.private_list:
+            if global_config.chat.private_list_type == "whitelist" and user_id not in global_config.chat.private_list:
                 logger.warning("私聊不在聊天白名单中，消息被丢弃")
                 return False
-            elif global_config.private_list_type == "blacklist" and user_id in global_config.private_list:
+            elif global_config.chat.private_list_type == "blacklist" and user_id in global_config.chat.private_list:
                 logger.warning("私聊在聊天黑名单中，消息被丢弃")
                 return False
-        if user_id in global_config.ban_user_id:
+        if user_id in global_config.chat.ban_user_id and not ignore_global_list:
             logger.warning("用户在全局黑名单中，消息被丢弃")
             return False
         return True
@@ -98,7 +97,7 @@ class RecvHandler:
     async def handle_raw_message(self, raw_message: dict) -> None:
         # sourcery skip: low-code-quality, remove-unreachable-code
         """
-        从gocq接受的原始消息处理
+        从Napcat接受的原始消息处理
 
         Parameters:
             raw_message: dict: 原始消息
@@ -110,20 +109,20 @@ class RecvHandler:
 
         template_info: TemplateInfo = None  # 模板信息，暂时为空，等待启用
         format_info: FormatInfo = FormatInfo(
-            content_format=["text", "image", "emoji"],
-            accept_format=["text", "image", "emoji", "reply", "voice", "command"],
+            content_format=["text", "image", "emoji", "voice"],
+            accept_format=ACCEPT_FORMAT,
         )  # 格式化信息
         if message_type == MessageType.private:
             sub_type = raw_message.get("sub_type")
             if sub_type == MessageType.Private.friend:
                 sender_info: dict = raw_message.get("sender")
 
-                if not self.check_allow_to_chat(sender_info.get("user_id"), None):
+                if not await self.check_allow_to_chat(sender_info.get("user_id"), None):
                     return None
 
                 # 发送者用户信息
                 user_info: UserInfo = UserInfo(
-                    platform=global_config.platform,
+                    platform=global_config.maibot_server.platform_name,
                     user_id=sender_info.get("user_id"),
                     user_nickname=sender_info.get("nickname"),
                     user_cardname=sender_info.get("card"),
@@ -140,7 +139,7 @@ class RecvHandler:
 
                 sender_info: dict = raw_message.get("sender")
 
-                # 由于临时会话中，gocq默认不发送成员昵称，所以需要单独获取
+                # 由于临时会话中，Napcat默认不发送成员昵称，所以需要单独获取
                 fetched_member_info: dict = await get_member_info(
                     self.server_connection,
                     raw_message.get("group_id"),
@@ -149,7 +148,7 @@ class RecvHandler:
                 nickname = fetched_member_info.get("nickname") if fetched_member_info else None
                 # 发送者用户信息
                 user_info: UserInfo = UserInfo(
-                    platform=global_config.platform,
+                    platform=global_config.maibot_server.platform_name,
                     user_id=sender_info.get("user_id"),
                     user_nickname=nickname,
                     user_cardname=None,
@@ -164,7 +163,7 @@ class RecvHandler:
                     group_name = fetched_group_info.get("group_name")
 
                 group_info: GroupInfo = GroupInfo(
-                    platform=global_config.platform,
+                    platform=global_config.maibot_server.platform_name,
                     group_id=raw_message.get("group_id"),
                     group_name=group_name,
                 )
@@ -177,12 +176,12 @@ class RecvHandler:
             if sub_type == MessageType.Group.normal:
                 sender_info: dict = raw_message.get("sender")
 
-                if not self.check_allow_to_chat(sender_info.get("user_id"), raw_message.get("group_id")):
+                if not await self.check_allow_to_chat(sender_info.get("user_id"), raw_message.get("group_id")):
                     return None
 
                 # 发送者用户信息
                 user_info: UserInfo = UserInfo(
-                    platform=global_config.platform,
+                    platform=global_config.maibot_server.platform_name,
                     user_id=sender_info.get("user_id"),
                     user_nickname=sender_info.get("nickname"),
                     user_cardname=sender_info.get("card"),
@@ -195,7 +194,7 @@ class RecvHandler:
                     group_name = fetched_group_info.get("group_name")
 
                 group_info: GroupInfo = GroupInfo(
-                    platform=global_config.platform,
+                    platform=global_config.maibot_server.platform_name,
                     group_id=raw_message.get("group_id"),
                     group_name=group_name,
                 )
@@ -205,12 +204,12 @@ class RecvHandler:
                 return None
 
         additional_config: dict = {}
-        if global_config.use_tts:
+        if global_config.voice.use_tts:
             additional_config["allow_tts"] = True
 
         # 消息信息
         message_info: BaseMessageInfo = BaseMessageInfo(
-            platform=global_config.platform,
+            platform=global_config.maibot_server.platform_name,
             message_id=message_id,
             time=message_time,
             user_info=user_info,
@@ -242,130 +241,93 @@ class RecvHandler:
         )
 
         logger.info("发送到Maibot处理信息")
-        await self.message_process(message_base)
+        await message_send_instance.message_send(message_base)
 
     async def handle_real_message(self, raw_message: dict, in_reply: bool = False) -> List[Seg] | None:
+        # sourcery skip: low-code-quality
         """
         处理实际消息
         Parameters:
-            raw_message: dict: 原始消息
+            real_message: dict: 实际消息
         Returns:
             seg_message: list[Seg]: 处理后的消息段列表
         """
-        real_message: str = raw_message.get("message")
-        logger.info(f"处理消息: {raw_message}")
+        real_message: list = raw_message.get("message")
         if not real_message:
             return None
         seg_message: List[Seg] = []
-        # 处理图片消息
-        # [CQ:image,file={Name},subType={消息类型},url={Image URL}]
-        # 提取图片消息的URL和文件名
-        image_pattern = r'\[CQ:image,file=(.*?),subType=(.*?),url=(.*?)\]'
-        import re
-        image_matches = re.findall(image_pattern, real_message)
-        logger.info(f"image_matches: {image_matches}")
-        # 处理图片消息，将图片URL添加到seg_message列表中，同时将图片消息从real_message中删除，防止重复处理
-        for i in image_matches:
-            url = i[2]
-            imgbase64 = await get_image_base64(url)
-            if imgbase64:
-                if i[1] == "0":
-                    seg_message.append(Seg(type="image", data=imgbase64))
-                elif i[1] == "1":
-                    seg_message.append(Seg(type="emoji", data=imgbase64))
-        # 处理纯文本消息
-        text_pattern = re.sub(image_pattern, '', real_message)
-        text_pattern = text_pattern.replace('"', '')
-        logger.info(f"text_pattern: {text_pattern}")
-        # 处理@消息
-        at_pattern = r'\[CQ:at,qq=(.*?)\]'
-        at_matches = re.findall(at_pattern, real_message)
-        logger.info(f"at_matches: {at_matches}")
-        for qq_id in at_matches:
-            user_info = await get_member_info(self.server_connection, raw_message.get('group_id'), qq_id)
-            if user_info:
-                nickname = user_info.get('nickname')
-                seg_message.append(Seg(type="text", data=f"@{nickname}({qq_id})"))
-            # 去除消息中的CQ:at标签
-            text_pattern = text_pattern.replace(f'[CQ:at,qq={qq_id}]', '')
-        # 处理引用消息
-        reply_pattern = r'\[CQ:reply,id=(.*?)\]'
-        reply_matches = re.findall(reply_pattern, real_message)
-        logger.info(f"reply_matches: {reply_matches}")
-        json_pattern = r'\[CQ:json,data=(.*?)\]'
-        json_matches = re.findall(json_pattern, real_message)
-        logger.info(f"json_matches: {json_matches}")
-        # 处理json消息
-        for json_data in json_matches:
-            # 存储未处理的json_data
-            unprocessed_json_data = json_data
-            # 转义
-            json_data = json_data.replace('&quot;', '"')
-            json_data = json_data.replace('&lt;', '<')
-            json_data = json_data.replace('&gt;', '>')
-            json_data = json_data.replace('&amp;', '&')
-            json_data = json_data.replace('&#44;', ',')
-            json_data = json_data.replace('&#91;', '[')
-            json_data = json_data.replace('&#93;', ']')
-            json_data = json_data.replace('&#123;', '{')
-            json_data = json_data.replace('&#125;', '}')
-            json_data = json_data.replace('&#46;', '.')
-            json_data = json_data.replace('&#58;', ':')
-            json_data = json_data.replace('&#45;', '-')
-            json_data = json_data.replace('&#43;', '+')
-            json_data = json_data.replace('&#61;', '=')
-            json_data = json_data.replace('&#39;', "'")
-            json_data = json_data.replace('&#34;', '"')
-            json_data = json_data.replace('&#47;', '/')
-            json_data = json_data.replace('&#92;', '\\')
-            json_data = json_data.replace('&#126;', '~')
-            json_data = json_data.replace('&#33;', '!')
-            json_data = json_data.replace('&#64;', '@')
-            try:
-                # 尝试解析JSON数据
-                json_data = json.loads(json_data)
-                # 查看群公告可能性
-                # 检测是否是群公告
-                # 去除消息中的CQ:json标签
-                text_pattern = text_pattern.replace(f'[CQ:json,data={json.dumps(unprocessed_json_data)}]', '')
-                logger.info(f"原始JSON数据：{json_data}")
-                if json_data.get('meta') and json_data.get('meta').get('mannounce'):
-                    # 提取群公告内容
-                    text = json_data.get('prompt')
-                    # 提取群公告时间
-                    time_stamp = json_data.get('meta').get('mannounce').get('ctime')
-                    time_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time_stamp))
-                    user = await get_member_info(self.server_connection, raw_message.get('group_id'), json_data.get('meta').get('mannounce').get('uin'))
-                    if user:
-                        text = f"{user.get('nickname')}({user.get('user_id')})：{text}"
+        for sub_message in real_message:
+            sub_message: dict
+            sub_message_type = sub_message.get("type")
+            match sub_message_type:
+                case RealMessageType.text:
+                    ret_seg = await self.handle_text_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
                     else:
-                        text = f"未知用户：{text}"
-                    logger.info(f"群公告：{text} 发布时间：{time_stamp} 用户信息：{user}")
-                    seg_message.append(Seg(type="text", data=f"群公告：{text} 发布时间：{time_stamp} 用户信息：{user}"))
-                else:
-                    # 不是群公告，直接添加到消息段列表中
-                    seg_message.append(Seg(type="json", data=json_data))
-            except json.JSONDecodeError:
-                # 如果解析失败，直接添加到消息段列表中
-                seg_message.append(Seg(type="text", data=json_data))
-
-        for reply_id in reply_matches:
-            # 获取引用消息的详细信息
-            reply_message = await get_message_detail(self.server_connection, reply_id)
-            # 加入前缀
-            if reply_message:
-                logger.info(f"reply_message: {reply_message}")
-                # 加入前缀"回复 @xxx"
-                if reply_message.get('sender').get('user_id') == raw_message.get('user_id'):
-                    reply_message = f"回复 @{raw_message.get('sender').get('nickname')}：" + reply_message.get('message')
-                else:
-                    reply_message = f"回复 @{reply_message.get('sender').get('nickname')}：" + reply_message.get('message')
-                # 返回
-                seg_message.append(Seg(type="reply", data=reply_message))
-
-
-        if text_pattern.strip():
-            seg_message.append(Seg(type="text", data=text_pattern.strip()))
+                        logger.warning("text处理失败")
+                case RealMessageType.face:
+                    ret_seg = await self.handle_face_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("face处理失败或不支持")
+                case RealMessageType.reply:
+                    if not in_reply:
+                        ret_seg = await self.handle_reply_message(sub_message)
+                        if ret_seg:
+                            seg_message += ret_seg
+                        else:
+                            logger.warning("reply处理失败")
+                case RealMessageType.image:
+                    ret_seg = await self.handle_image_message(sub_message)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("image处理失败")
+                case RealMessageType.record:
+                    ret_seg = await self.handle_record_message(sub_message)
+                    if ret_seg:
+                        seg_message.clear()
+                        seg_message.append(ret_seg)
+                        break  # 使得消息只有record消息
+                    else:
+                        logger.warning("record处理失败或不支持")
+                case RealMessageType.video:
+                    logger.warning("不支持视频解析")
+                case RealMessageType.at:
+                    ret_seg = await self.handle_at_message(
+                        sub_message,
+                        raw_message.get("self_id"),
+                        raw_message.get("group_id"),
+                    )
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("at处理失败")
+                case RealMessageType.rps:
+                    logger.warning("暂时不支持猜拳魔法表情解析")
+                case RealMessageType.dice:
+                    logger.warning("暂时不支持骰子表情解析")
+                case RealMessageType.shake:
+                    # 预计等价于戳一戳
+                    logger.warning("暂时不支持窗口抖动解析")
+                case RealMessageType.share:
+                    logger.warning("暂时不支持链接解析")
+                case RealMessageType.forward:
+                    messages = await self._get_forward_message(sub_message)
+                    if not messages:
+                        logger.warning("转发消息内容为空或获取失败")
+                        return None
+                    ret_seg = await self.handle_forward_message(messages)
+                    if ret_seg:
+                        seg_message.append(ret_seg)
+                    else:
+                        logger.warning("转发消息处理失败")
+                case RealMessageType.node:
+                    logger.warning("不支持转发消息节点解析")
+                case _:
+                    logger.warning(f"未知消息类型: {sub_message_type}")
         return seg_message
 
     async def handle_text_message(self, raw_message: dict) -> Seg:
@@ -415,7 +377,7 @@ class RecvHandler:
         if image_sub_type == 0:
             """这部分认为是图片"""
             return Seg(type="image", data=image_base64)
-        elif image_sub_type == 1:
+        elif image_sub_type not in [4, 9]:
             """这部分认为是表情包"""
             return Seg(type="emoji", data=image_base64)
         else:
@@ -450,39 +412,26 @@ class RecvHandler:
                 else:
                     return None
 
-    async def get_forward_message(self, raw_message: dict) -> Dict[str, Any] | None:
-        forward_message_data: Dict = raw_message.get("data")
-        if not forward_message_data:
-            logger.warning("转发消息内容为空")
-            return None
-        forward_message_id = forward_message_data.get("id")
-        request_uuid = str(uuid.uuid4())
-        payload = json.dumps(
-            {
-                "action": "get_forward_msg",
-                "params": {"message_id": forward_message_id},
-                "echo": request_uuid,
-            }
-        )
+    async def handle_record_message(self, raw_message: dict) -> Seg | None:
+        """
+        处理语音消息
+        Parameters:
+            raw_message: dict: 原始消息
+        Returns:
+            seg_data: Seg: 处理后的消息段
+        """
+        message_data: dict = raw_message.get("data")
+        file: str = message_data.get("file")
         try:
-            await self.server_connection.send(payload)
-            response: dict = await get_response(request_uuid)
-        except TimeoutError:
-            logger.error("获取转发消息超时")
-            return None
+            record_detail = await get_record_detail(self.server_connection, file)
+            audio_base64: str = record_detail.get("base64")
         except Exception as e:
-            logger.error(f"获取转发消息失败: {str(e)}")
+            logger.error(f"语音消息处理失败: {str(e)}")
             return None
-        logger.debug(
-            f"转发消息原始格式：{json.dumps(response)[:80]}..."
-            if len(json.dumps(response)) > 80
-            else json.dumps(response)
-        )
-        response_data: Dict = response.get("data")
-        if not response_data:
-            logger.warning("转发消息内容为空或获取失败")
+        if not audio_base64:
+            logger.error("语音消息处理失败，未获取到音频数据")
             return None
-        return response_data.get("messages")
+        return Seg(type="voice", data=audio_base64)
 
     async def handle_reply_message(self, raw_message: dict) -> List[Seg] | None:
         # sourcery skip: move-assign-in-block, use-named-expression
@@ -515,137 +464,6 @@ class RecvHandler:
         seg_message += reply_message
         seg_message.append(Seg(type="text", data="]，说："))
         return seg_message
-
-    async def handle_notice(self, raw_message: dict) -> None:
-        notice_type = raw_message.get("notice_type")
-        # message_time: int = raw_message.get("time")
-        message_time: float = time.time()  # 应可乐要求，现在是float了
-
-        group_id = raw_message.get("group_id")
-        user_id = raw_message.get("user_id")
-        handled_message: Seg = None
-
-        match notice_type:
-            case NoticeType.friend_recall:
-                logger.info("好友撤回一条消息")
-                logger.info(f"撤回消息ID：{raw_message.get('message_id')}, 撤回时间：{raw_message.get('time')}")
-                logger.warning("暂时不支持撤回消息处理")
-            case NoticeType.group_recall:
-                logger.info("群内用户撤回一条消息")
-                logger.info(f"撤回消息ID：{raw_message.get('message_id')}, 撤回时间：{raw_message.get('time')}")
-                logger.warning("暂时不支持撤回消息处理")
-            case NoticeType.notify:
-                sub_type = raw_message.get("sub_type")
-                match sub_type:
-                    case NoticeType.Notify.poke:
-                        if global_config.enable_poke:
-                            handled_message: Seg = await self.handle_poke_notify(raw_message)
-                        else:
-                            logger.warning("戳一戳消息被禁用，取消戳一戳处理")
-                    case _:
-                        logger.warning(f"不支持的notify类型: {notice_type}.{sub_type}")
-            case _:
-                logger.warning(f"不支持的notice类型: {notice_type}")
-                return None
-        if not handled_message:
-            logger.warning("notice处理失败或不支持")
-            return None
-
-        source_name: str = None
-        source_cardname: str = None
-        if group_id:
-            member_info: dict = await get_member_info(self.server_connection, group_id, user_id)
-            if member_info:
-                source_name = member_info.get("nickname")
-                source_cardname = member_info.get("card")
-            else:
-                logger.warning("无法获取戳一戳消息发送者的昵称，消息可能会无效")
-                source_name = "QQ用户"
-        else:
-            stranger_info = await get_stranger_info(self.server_connection, user_id)
-            if stranger_info:
-                source_name = stranger_info.get("nickname")
-            else:
-                logger.warning("无法获取戳一戳消息发送者的昵称，消息可能会无效")
-                source_name = "QQ用户"
-
-        user_info: UserInfo = UserInfo(
-            platform=global_config.platform,
-            user_id=user_id,
-            user_nickname=source_name,
-            user_cardname=source_cardname,
-        )
-
-        group_info: GroupInfo = None
-        if group_id:
-            fetched_group_info = await get_group_info(self.server_connection, group_id)
-            group_name: str = None
-            if fetched_group_info:
-                group_name = fetched_group_info.get("group_name")
-            else:
-                logger.warning("无法获取戳一戳消息所在群的名称")
-            group_info = GroupInfo(
-                platform=global_config.platform,
-                group_id=group_id,
-                group_name=group_name,
-            )
-
-        message_info: BaseMessageInfo = BaseMessageInfo(
-            platform=global_config.platform,
-            message_id="notice",
-            time=message_time,
-            user_info=user_info,
-            group_info=group_info,
-            template_info=None,
-            format_info=None,
-        )
-
-        message_base: MessageBase = MessageBase(
-            message_info=message_info,
-            message_segment=handled_message,
-            raw_message=json.dumps(raw_message),
-        )
-
-        logger.info("发送到Maibot处理通知信息")
-        await self.message_process(message_base)
-
-    async def handle_poke_notify(self, raw_message: dict) -> Seg | None:
-        self_info: dict = await get_self_info(self.server_connection)
-        if not self_info:
-            logger.error("自身信息获取失败")
-            return None
-        self_id = raw_message.get("self_id")
-        target_id = raw_message.get("target_id")
-        target_name: str = None
-        raw_info: list = raw_message.get("raw_info")
-        # 计算Seg
-        if self_id == target_id:
-            target_name = self_info.get("nickname")
-        else:
-            return None
-        try:
-            first_txt = raw_info[2].get("txt", "戳了戳")
-            second_txt = raw_info[4].get("txt", "")
-        except Exception as e:
-            logger.warning(f"解析戳一戳消息失败: {str(e)}，将使用默认文本")
-            first_txt = "戳了戳"
-            second_txt = ""
-        """
-        # 不启用戳其他人的处理
-        else:
-            # 由于gocq不支持获取昵称，所以需要单独获取
-            group_id = raw_message.get("group_id")
-            fetched_member_info: dict = await get_member_info(
-                self.server_connection, group_id, target_id
-            )
-            if fetched_member_info:
-                target_name = fetched_member_info.get("nickname")
-        """
-        seg_data: Seg = Seg(
-            type="text",
-            data=f"{first_txt}{target_name}{second_txt}（这是QQ的一个功能，用于提及某人，但没那么明显）",
-        )
-        return seg_data
 
     async def handle_forward_message(self, message_list: list) -> Seg | None:
         """
@@ -735,7 +553,7 @@ class RecvHandler:
             user_nickname: str = sender_info.get("nickname", "QQ用户")
             user_nickname_str = f"【{user_nickname}】:"
             break_seg = Seg(type="text", data="\n")
-            message_of_sub_message_list: dict = sub_message.get("message")
+            message_of_sub_message_list: List[Dict[str, Any]] = sub_message.get("message")
             if not message_of_sub_message_list:
                 logger.warning("转发消息内容为空")
                 continue
@@ -805,13 +623,39 @@ class RecvHandler:
                 seg_list.append(full_seg_data)
         return Seg(type="seglist", data=seg_list), image_count
 
-    async def message_process(self, message_base: MessageBase) -> None:
-        try:
-            await self.maibot_router.send_message(message_base)
-        except Exception as e:
-            logger.error(f"发送消息失败: {str(e)}")
-            logger.error("请检查与MaiBot之间的连接")
+    async def _get_forward_message(self, raw_message: dict) -> Dict[str, Any] | None:
+        forward_message_data: Dict = raw_message.get("data")
+        if not forward_message_data:
+            logger.warning("转发消息内容为空")
             return None
+        forward_message_id = forward_message_data.get("id")
+        request_uuid = str(uuid.uuid4())
+        payload = json.dumps(
+            {
+                "action": "get_forward_msg",
+                "params": {"message_id": forward_message_id},
+                "echo": request_uuid,
+            }
+        )
+        try:
+            await self.server_connection.send(payload)
+            response: dict = await get_response(request_uuid)
+        except TimeoutError:
+            logger.error("获取转发消息超时")
+            return None
+        except Exception as e:
+            logger.error(f"获取转发消息失败: {str(e)}")
+            return None
+        logger.debug(
+            f"转发消息原始格式：{json.dumps(response)[:80]}..."
+            if len(json.dumps(response)) > 80
+            else json.dumps(response)
+        )
+        response_data: Dict = response.get("data")
+        if not response_data:
+            logger.warning("转发消息内容为空或获取失败")
+            return None
+        return response_data.get("messages")
 
 
-recv_handler = RecvHandler()
+message_handler = MessageHandler()

@@ -12,14 +12,19 @@ from typing import Dict, Any, Tuple
 
 from . import CommandType
 from .config import global_config
-from .message_queue import get_response
+from .response_pool import get_response
 from .logger import logger
 from .utils import get_image_format, convert_image_to_gif
+from .recv_handler.message_sending import message_send_instance
 
 
 class SendHandler:
     def __init__(self):
         self.server_connection: Server.ServerConnection = None
+
+    async def set_server_connection(self, server_connection: Server.ServerConnection) -> None:
+        """设置Napcat连接"""
+        self.server_connection = server_connection
 
     async def handle_message(self, raw_message_base_dict: dict) -> None:
         raw_message_base: MessageBase = MessageBase.from_dict(raw_message_base_dict)
@@ -76,6 +81,8 @@ class SendHandler:
         )
         if response.get("status") == "ok":
             logger.info("消息发送成功")
+            qq_message_id = response.get("data", {}).get("message_id")
+            await self.message_sent_back(raw_message_base, qq_message_id)
         else:
             logger.warning(f"消息发送失败，napcat返回：{str(response)}")
 
@@ -97,6 +104,12 @@ class SendHandler:
                     command, args_dict = self.handle_whole_ban_command(seg_data.get("args"), group_info)
                 case CommandType.GROUP_KICK.name:
                     command, args_dict = self.handle_kick_command(seg_data.get("args"), group_info)
+                case CommandType.SEND_POKE.name:
+                    command, args_dict = self.handle_poke_command(seg_data.get("args"), group_info)
+                case CommandType.DELETE_MSG.name:
+                    command, args_dict = self.delete_msg_command(seg_data.get("args"))
+                case CommandType.AI_VOICE_SEND.name:
+                    command, args_dict = self.handle_ai_voice_send_command(seg_data.get("args"), group_info)
                 case _:
                     logger.error(f"未知命令: {command_name}")
                     return
@@ -156,6 +169,15 @@ class SendHandler:
         elif seg.type == "voice":
             voice = seg.data
             new_payload = self.build_payload(payload, self.handle_voice_message(voice), False)
+        elif seg.type == "voiceurl":
+            voice_url = seg.data
+            new_payload = self.build_payload(payload, self.handle_voiceurl_message(voice_url), False)
+        elif seg.type == "music":
+            song_id = seg.data
+            new_payload = self.build_payload(payload, self.handle_music_message(song_id), False)
+        elif seg.type == "videourl":
+            video_url = seg.data
+            new_payload = self.build_payload(payload, self.handle_videourl_message(video_url), False)
         return new_payload
 
     def build_payload(self, payload: list, addon: dict, is_reply: bool = False) -> list:
@@ -209,7 +231,7 @@ class SendHandler:
 
     def handle_voice_message(self, encoded_voice: str) -> dict:
         """处理语音消息"""
-        if not global_config.use_tts:
+        if not global_config.voice.use_tts:
             logger.warning("未启用语音消息处理")
             return {}
         if not encoded_voice:
@@ -217,6 +239,26 @@ class SendHandler:
         return {
             "type": "record",
             "data": {"file": f"base64://{encoded_voice}"},
+        }
+
+    def handle_voiceurl_message(self, voice_url: str) -> dict:
+        """处理语音链接消息"""
+        return {
+            "type": "record",
+            "data": {"file": voice_url},
+        }
+
+    def handle_music_message(self, song_id: str) -> dict:
+        """处理音乐消息"""
+        return {
+            "type": "music",
+            "data": {"type": "163", "id": song_id},
+        }
+    def handle_videourl_message(self, video_url: str) -> dict:
+        """处理视频链接消息"""
+        return {
+            "type": "video",
+            "data": {"file": video_url},
         }
 
     def handle_ban_command(self, args: Dict[str, Any], group_info: GroupInfo) -> Tuple[str, Dict[str, Any]]:
@@ -229,16 +271,11 @@ class SendHandler:
         Returns:
             Tuple[CommandType, Dict[str, Any]]
         """
-        if not args.get("duration") or not args.get("qq_id"):
-            raise ValueError("封禁命令缺少必要参数")
-        try:
-            duration: int = int(args["duration"])
-            user_id: int = int(args["qq_id"])
-            group_id: int = int(group_info.group_id)
-        except ValueError:
-            raise ValueError("参数必须为有效数字")
-        if duration <= 0:
-            raise ValueError("封禁时间必须大于0")
+        duration: int = int(args["duration"])
+        user_id: int = int(args["qq_id"])
+        group_id: int = int(group_info.group_id)
+        if duration < 0:
+            raise ValueError("封禁时间必须大于等于0")
         if not user_id or not group_id:
             raise ValueError("封禁命令缺少必要参数")
         if duration > 2592000:
@@ -274,7 +311,7 @@ class SendHandler:
                 "enable": enable,
             },
         )
-    
+
     def handle_kick_command(self, args: Dict[str, Any], group_info: GroupInfo) -> Tuple[str, Dict[str, Any]]:
         """处理群成员踢出命令
 
@@ -285,13 +322,8 @@ class SendHandler:
         Returns:
             Tuple[CommandType, Dict[str, Any]]
         """
-        if not args.get("qq_id"):
-            raise ValueError("踢出命令缺少必要参数")
-        try:
-            user_id: int = int(args["qq_id"])
-            group_id: int = int(group_info.group_id)
-        except ValueError:
-            raise ValueError("参数必须为有效数字")
+        user_id: int = int(args["qq_id"])
+        group_id: int = int(group_info.group_id)
         if group_id <= 0:
             raise ValueError("群组ID无效")
         if user_id <= 0:
@@ -304,14 +336,91 @@ class SendHandler:
                 "reject_add_request": False,  # 不拒绝加群请求
             },
         )
-    
+
+    def handle_poke_command(self, args: Dict[str, Any], group_info: GroupInfo) -> Tuple[str, Dict[str, Any]]:
+        """处理戳一戳命令
+
+        Args:
+            args (Dict[str, Any]): 参数字典
+            group_info (GroupInfo): 群聊信息（对应目标群聊）
+
+        Returns:
+            Tuple[CommandType, Dict[str, Any]]
+        """
+        user_id: int = int(args["qq_id"])
+        if group_info is None:
+            group_id = None
+        else:
+            group_id: int = int(group_info.group_id)
+            if group_id <= 0:
+                raise ValueError("群组ID无效")
+        if user_id <= 0:
+            raise ValueError("用户ID无效")
+        return (
+            CommandType.SEND_POKE.value,
+            {
+                "group_id": group_id,
+                "user_id": user_id,
+            },
+        )
+
+    def delete_msg_command(self, args: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """处理撤回消息命令
+
+        Args:
+            args (Dict[str, Any]): 参数字典
+
+        Returns:
+            Tuple[CommandType, Dict[str, Any]]
+        """
+        try:
+            message_id = int(args["message_id"])
+            if message_id <= 0:
+                raise ValueError("消息ID无效")
+        except KeyError:
+            raise ValueError("缺少必需参数: message_id") from None
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"消息ID无效: {args['message_id']} - {str(e)}") from None
+
+        return (
+            CommandType.DELETE_MSG.value,
+            {
+                "message_id": message_id,
+            },
+        )
+
+    def handle_ai_voice_send_command(self, args: Dict[str, Any], group_info: GroupInfo) -> Tuple[str, Dict[str, Any]]:
+        """
+        处理AI语音发送命令的逻辑。
+        并返回 NapCat 兼容的 (action, params) 元组。
+        """
+        if not group_info or not group_info.group_id:
+            raise ValueError("AI语音发送命令必须在群聊上下文中使用")
+        if not args:
+            raise ValueError("AI语音发送命令缺少参数")
+
+        group_id: int = int(group_info.group_id)
+        character_id = args.get("character")
+        text_content = args.get("text")
+
+        if not character_id or not text_content:
+            raise ValueError(f"AI语音发送命令参数不完整: character='{character_id}', text='{text_content}'")
+
+        return (
+            CommandType.AI_VOICE_SEND.value,
+            {
+                "group_id": group_id,
+                "text": text_content,
+                "character": character_id,
+            },
+        )
+
     async def send_message_to_napcat(self, action: str, params: dict) -> dict:
         request_uuid = str(uuid.uuid4())
         payload = json.dumps({"action": action, "params": params, "echo": request_uuid})
         await self.server_connection.send(payload)
         try:
             response = await get_response(request_uuid)
-            logger.info(f"收到响应: {response}")
         except TimeoutError:
             logger.error("发送消息超时，未收到响应")
             return {"status": "error", "message": "timeout"}
@@ -319,6 +428,24 @@ class SendHandler:
             logger.error(f"发送消息失败: {e}")
             return {"status": "error", "message": str(e)}
         return response
+
+    async def message_sent_back(self, message_base: MessageBase, qq_message_id: str) -> None:
+        # 修改 additional_config，添加 echo 字段
+        if message_base.message_info.additional_config is None:
+            message_base.message_info.additional_config = {}
+
+        message_base.message_info.additional_config["echo"] = True
+
+        # 获取原始的 mmc_message_id
+        mmc_message_id = message_base.message_info.message_id
+
+        # 修改 message_segment 为 notify 类型
+        message_base.message_segment = Seg(
+            type="notify", data={"sub_type": "echo", "echo": mmc_message_id, "actual_id": qq_message_id}
+        )
+        await message_send_instance.message_send(message_base)
+        logger.debug("已回送消息ID")
+        return
 
 
 send_handler = SendHandler()
